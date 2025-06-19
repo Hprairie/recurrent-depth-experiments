@@ -9,7 +9,7 @@ from typing import Any, Optional, Union
 import torch
 from torch import Tensor
 
-from recpre.config_dynamic import Config, GPTConfig, RecurrentConfig
+from recdep.recpre.config_dynamic import Config, GPTConfig, RecurrentConfig
 from .ops import LinearCrossEntropyLoss
 
 
