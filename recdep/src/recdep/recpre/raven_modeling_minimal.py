@@ -376,7 +376,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         past_key_values: Optional[Cache] = None,
         output_details: dict = {
             "return_logits": True,
-            "return_latents": True,
+            "return_latents": False,
             "return_attention": True,
             "return_head": False,
             "return_stats": False,
@@ -384,6 +384,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         },
         use_cache: bool = False,
         cache_position: Optional[torch.Tensor] = None,
+        move_to_cpu: bool = False,
         **kwargs,
     ) -> CausalLMOutputRecurrentLatents:
         # Support multiple position formats:
@@ -409,11 +410,12 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
 
         # Non-recurrent prelude
         for block_idx, block in enumerate(self.transformer.prelude):
+            print(block_idx)
             input_embeds, attn_map, activation_map = block(
                 input_embeds, freqs_cis, block_idx, attention_mask, past_key_values, return_attn=return_attn, return_activation=return_activation,
             )
-            attn_maps[block_idx] = attn_map
-            activation_maps[block_idx] = activation_map
+            attn_maps[block_idx] = attn_map.to('cpu') if move_to_cpu else attn_map
+            activation_maps[block_idx] = activation_map.to('cpu') if move_to_cpu else activation_map
 
         # Main recurrence
         x, num_steps_no_grad, num_steps_with_grad, xk, block_idx, attn_maps, activation_maps = self.iterate_forward(
@@ -428,6 +430,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             activation_maps,
             return_attn=return_attn,
             return_activation=return_activation,
+            move_to_cpu=move_to_cpu,
         )
         latent_states = x.clone().detach()
 
@@ -436,8 +439,8 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             x, attn_map, activation_map = block(
                 x, freqs_cis, -block_idx, attention_mask, past_key_values, return_attn=return_attn, return_activation=return_activation,
             )
-            attn_maps[-block_idx] = attn_map
-            activation_maps[-activation_map] = activation_map
+            attn_maps[-block_idx] = attn_map.to('cpu') if move_to_cpu else attn_map
+            activation_maps[-activation_map] = activation_map.to('cpu') if move_to_cpu else activation_map
         x = self.transformer.ln_f(x)
 
         # Prediction head, assuming labels really are labels and not equal to input_ids
@@ -477,6 +480,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         activation_maps: dict = {},
         return_attn: bool = False,
         return_activation: bool = False,
+        move_to_cpu: bool = False,
     ):
         x = xk = self.initialize_state(input_embeds) if input_states is None else input_states.clone()
         if num_steps is None:
@@ -494,13 +498,13 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             for step in range(num_steps_no_grad):
                 xk = x
                 x, block_idx, attn_maps, activation_maps = self.core_block_forward(
-                    xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, activation_maps, return_attn, return_activation
+                    xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, activation_maps, return_attn, return_activation, move_to_cpu,
                 )
 
         for step in range(num_steps_with_grad):
             xk = x
             x, block_idx, attn_maps, activation_maps = self.core_block_forward(
-                xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, activation_maps, return_attn, return_activation,
+                xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, activation_maps, return_attn, return_activation, move_to_cpu,
             )
         return self.transformer.ln_f(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx, attn_maps, activation_maps
 
@@ -516,12 +520,13 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         activation_maps: dict = {},
         return_attn: bool = False,
         return_activation: bool = False,
+        move_to_cpu: bool = False,
     ):
         x = self.transformer.adapter(torch.cat([x, input_embeds.to(x.device)], dim=-1))
         for idx, block in enumerate(self.transformer.core_block, start=1):
             x, attn_map, activation_map = block(x, freqs_cis, block_idx + idx, mask, past_key_values, return_attn=return_attn, return_activation=return_activation)
-            attn_maps[block_idx + idx] = attn_map
-            activation_maps[block_idx + idx] = activation_map
+            attn_maps[block_idx + idx] = attn_map.to('cpu') if move_to_cpu else attn_map
+            activation_maps[block_idx + idx] = activation_map.to('cpu') if move_to_cpu else activation_map
         return x, block_idx + idx, attn_maps, activation_maps
 
     @torch.no_grad()
