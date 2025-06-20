@@ -46,6 +46,7 @@ class CausalLMOutputRecurrentLatents(ModelOutput):
     latent_states: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
     attention_maps: Optional[dict[int, torch.Tensor]] = None
+    activation_maps: Optional[dict[int, torch.Tensor]] = None
     stats: Optional[dict] = None
 
 
@@ -276,11 +277,12 @@ class GatedMLP(torch.nn.Module):
         self.proj = torch.nn.Linear(config.intermediate_size, config.n_embd, bias=False)
         self.nonlin = torch.nn.SiLU()
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, return_activation: bool = False) -> tuple[Tensor, Optional[Tensor]]:
         # modified to single FC layer to improve parallelism
         x_fc_1, x_fc_2 = self.fc(x).chunk(2, dim=-1)
-        x = self.nonlin(x_fc_1) * x_fc_2
-        return self.proj(x)
+        act = self.nonlin(x_fc_1)
+        x = act * x_fc_2
+        return self.proj(x), act if return_activation else None
 
 
 class SandwichBlock(torch.nn.Module):
@@ -304,11 +306,13 @@ class SandwichBlock(torch.nn.Module):
         mask: Optional[Tensor] = None,
         past_key_values: Optional[Cache] = None,
         return_attn: bool = False,
-    ) -> tuple[Tensor, Optional[Tensor]]:
+        return_activation: bool = False,
+    ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
         attn_out, attn_map = self.attn(self.norm_1(x), freqs_cis, step_idx, mask, past_key_values, return_attn)
         x = self.norm_2(attn_out + x)
-        x = self.norm_4(self.mlp(self.norm_3(x)) + x)
-        return x, attn_map
+        mlp_out, mlp_act = self.mlp(self.norm_3(x), return_activation)
+        x = self.norm_4(mlp_out + x)
+        return x, attn_map, mlp_act
 
 
 class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
@@ -373,9 +377,10 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         output_details: dict = {
             "return_logits": True,
             "return_latents": True,
-            "return_attention": False,
+            "return_attention": True,
             "return_head": False,
             "return_stats": False,
+            "return_activation": True,
         },
         use_cache: bool = False,
         cache_position: Optional[torch.Tensor] = None,
@@ -398,17 +403,20 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         if use_cache and past_key_values is None:
             past_key_values = HuginnDynamicCache()
         attn_maps = {}
+        activation_maps = {}
         return_attn = output_details["return_attention"]
+        return_activation = output_details["return_activation"]
 
         # Non-recurrent prelude
         for block_idx, block in enumerate(self.transformer.prelude):
-            input_embeds, attn_map = block(
-                input_embeds, freqs_cis, block_idx, attention_mask, past_key_values, return_attn=return_attn
+            input_embeds, attn_map, activation_map = block(
+                input_embeds, freqs_cis, block_idx, attention_mask, past_key_values, return_attn=return_attn, return_activation=return_activation,
             )
             attn_maps[block_idx] = attn_map
+            activation_maps[block_idx] = activation_map
 
         # Main recurrence
-        x, num_steps_no_grad, num_steps_with_grad, xk, block_idx, attn_maps = self.iterate_forward(
+        x, num_steps_no_grad, num_steps_with_grad, xk, block_idx, attn_maps, activation_maps = self.iterate_forward(
             input_embeds,  # type: ignore
             input_states,
             freqs_cis,
@@ -417,14 +425,19 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             past_key_values,
             num_steps,
             attn_maps,
+            activation_maps,
             return_attn=return_attn,
+            return_activation=return_activation,
         )
         latent_states = x.clone().detach()
 
         # Coda layers
         for block_idx, block in enumerate(self.transformer.coda, start=1):
-            x, attn_map = block(x, freqs_cis, -block_idx, attention_mask, past_key_values, return_attn=return_attn)
+            x, attn_map, activation_map = block(
+                x, freqs_cis, -block_idx, attention_mask, past_key_values, return_attn=return_attn, return_activation=return_activation,
+            )
             attn_maps[-block_idx] = attn_map
+            activation_maps[-activation_map] = activation_map
         x = self.transformer.ln_f(x)
 
         # Prediction head, assuming labels really are labels and not equal to input_ids
@@ -444,6 +457,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             hidden_states=x if output_details["return_head"] else None,
             latent_states=latent_states if output_details["return_latents"] else None,
             attention_maps=attn_maps if output_details["return_attention"] else None,  # type: ignore
+            activation_maps=activation_maps if output_details["return_activation"] else None,  # type: ignore
             stats=self.get_stats(logits, x, latent_states, xk, input_embeds, num_steps_no_grad, num_steps_with_grad)
             if output_details["return_stats"]
             else None,
@@ -460,7 +474,9 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         past_key_values: Optional[Cache] = None,
         num_steps: Optional[torch.Tensor] = None,
         attn_maps: dict = {},
+        activation_maps: dict = {},
         return_attn: bool = False,
+        return_activation: bool = False,
     ):
         x = xk = self.initialize_state(input_embeds) if input_states is None else input_states.clone()
         if num_steps is None:
@@ -477,16 +493,16 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             # and all parameters are always used
             for step in range(num_steps_no_grad):
                 xk = x
-                x, block_idx, attn_maps = self.core_block_forward(
-                    xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, return_attn
+                x, block_idx, attn_maps, activation_maps = self.core_block_forward(
+                    xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, activation_maps, return_attn, return_activation
                 )
 
         for step in range(num_steps_with_grad):
             xk = x
-            x, block_idx, attn_maps = self.core_block_forward(
-                xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, return_attn
+            x, block_idx, attn_maps, activation_maps = self.core_block_forward(
+                xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, attn_maps, activation_maps, return_attn, return_activation,
             )
-        return self.transformer.ln_f(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx, attn_maps
+        return self.transformer.ln_f(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx, attn_maps, activation_maps
 
     def core_block_forward(
         self,
@@ -497,13 +513,16 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         past_key_values,
         block_idx: Union[torch.Tensor, int],
         attn_maps: dict = {},
+        activation_maps: dict = {},
         return_attn: bool = False,
+        return_activation: bool = False,
     ):
         x = self.transformer.adapter(torch.cat([x, input_embeds.to(x.device)], dim=-1))
         for idx, block in enumerate(self.transformer.core_block, start=1):
-            x, attn_map = block(x, freqs_cis, block_idx + idx, mask, past_key_values, return_attn=return_attn)
+            x, attn_map, activation_map = block(x, freqs_cis, block_idx + idx, mask, past_key_values, return_attn=return_attn, return_activation=return_activation)
             attn_maps[block_idx + idx] = attn_map
-        return x, block_idx + idx, attn_maps
+            activation_maps[block_idx + idx] = activation_map
+        return x, block_idx + idx, attn_maps, activation_maps
 
     @torch.no_grad()
     def iterate_one_step(
