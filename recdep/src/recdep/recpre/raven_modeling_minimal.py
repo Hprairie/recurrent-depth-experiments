@@ -440,7 +440,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 x, freqs_cis, -block_idx, attention_mask, past_key_values, return_attn=return_attn, return_activation=return_activation,
             )
             attn_maps[-block_idx] = attn_map.to('cpu') if move_to_cpu else attn_map
-            activation_maps[-activation_map] = activation_map.to('cpu') if move_to_cpu else activation_map
+            activation_maps[-block_idx] = activation_map.to('cpu') if move_to_cpu else activation_map
         x = self.transformer.ln_f(x)
 
         # Prediction head, assuming labels really are labels and not equal to input_ids
